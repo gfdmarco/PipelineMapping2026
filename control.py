@@ -95,6 +95,7 @@ class PurePursuit:
         straight = self._straightFactor(path)
         lookahead += straight * max(0.0, self.straight_lookahead - lookahead)
 
+        self.last_lookahead = float(lookahead)
         target, dist = self._lookaheadPoint(path, lookahead)
         if target is None or dist < 1e-3:
             return None
@@ -165,7 +166,9 @@ class PurePursuit:
         if align <= 0.0:
             return 0.0
 
-        deviation = abs(np.mean(np.cross(pts[1:-1] - pts[0], chord / length)))
+        rel, u = pts[1:-1] - pts[0], chord / length
+        # produto vetorial 2D explicito (np.cross 2D foi removido no numpy 2)
+        deviation = abs(np.mean(rel[:, 0] * u[1] - rel[:, 1] * u[0]))
         return float(align *
                      np.clip(1.0 - deviation / self.straight_tolerance, 0.0, 1.0))
 
@@ -186,14 +189,20 @@ class VehicleController:
         self.lateral = PurePursuit()
         self.longitudinal = PID(KP, KI, KD)
         self.last_steering = 0.0
+        self.last_target = target_speed
+        self.last_no_path = False
 
-    def compute(self, path, speed, dt):
+    def compute(self, path, speed, dt, target_speed=None):
+        """target_speed: alvo do perfil global (modo TRACK); None = fixo."""
         steering = self.lateral.computeSteering(path, speed)
+        self.last_target = self.target_speed if target_speed is None else float(target_speed)
 
         if steering is None:
             # sem rota: segura o ultimo steering e desacelera
             self.longitudinal.reset()
+            self.last_no_path = True
             return self.last_steering, 0.0, 0.3 * self.max_brake
+        self.last_no_path = False
 
         # filtro passa-baixa de 1a ordem: suaviza o ruido frame a frame da
         # percepcao sem atrasar de forma relevante a entrada nas curvas
@@ -203,7 +212,7 @@ class VehicleController:
 
         self.last_steering = steering
 
-        u = self.longitudinal.update(self.target_speed - speed, dt)
+        u = self.longitudinal.update(self.last_target - speed, dt)
         throttle = float(np.clip(u, 0.0, self.max_throttle))
         brake = float(np.clip(-u, 0.0, self.max_brake))
 

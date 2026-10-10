@@ -1,13 +1,7 @@
 import numpy as np
 from scipy.spatial import Delaunay, QhullError
-import rclpy
-from rclpy.node import Node
-import os,sys
-from std_msgs.msg import Float32,Float32MultiArray,MultiArrayDimension,Bool
 from .pathPlanning import BLUE_ID, YELLOW_ID, MAX_EDGE_LENGTH
-
-from tf2_ros import Buffer, TransformListener, TransformException
-from rclpy.duration import Duration
+from .frames import world_to_car
 
 # Construcao da linha central global
 RESAMPLE_STEP = 1.0      # m   -> espacamento dos pontos da trajetoria
@@ -48,60 +42,34 @@ class GlobalTrajectory:
     DIRECTION_HORIZON = 6.0   # m de trajetoria usados para decidir o sentido
     DIRECTION_MARGIN = 1.0    # m de vantagem exigida para INVERTER o sentido
 
-    def __init__(self, points, speeds, car_node):
-        #PRECISO COLOCAR PRA RECEBER POINTS ESCUTANDO A CLASSE CONEMAPPER - IDEIA
-        self.points = points
-        self.speeds = speeds
-        self.car_node = car_node
+    def __init__(self, points, speeds, aggressiveness=0.0):
+        self.points = np.asarray(points, dtype=float)
+        self.speeds = np.asarray(speeds, dtype=float)
+        self.aggressiveness = aggressiveness
+        seg = np.linalg.norm(np.diff(np.vstack([self.points, self.points[:1]]), axis=0), axis=1)
+        self.length = float(seg.sum())
         self._step = None     # sentido de percurso decidido (com histerese)
 
     def localWindow(self, pose, window=30.0):
         """Trecho a frente do carro em [lateral, frente] + velocidade alvo.
 
-        Acha o ponto mais proximo do carro e devolve a janela seguinte
-        (dando a volta no laco), pronta para o controlador. O sentido de
-        percurso dos pontos e arbitrario (vem do encadeamento do mapa):
-        a janela segue na direcao que aponta junto com o carro. O sentido
-        e decidido pela MEDIA de ~6 m de trajetoria (a tangente de um
-        unico segmento de 1 m e loteria numa linha ondulada) e tem
-        histerese: so inverte com vantagem clara, senao um flip por frame
-        faz o carro tentar meia-volta na entrada do modo TRACK.
+        pose = (x, y, yaw) do carro no frame map. Acha o ponto mais
+        proximo e devolve a janela seguinte (dando a volta no laco),
+        pronta para o controlador. O sentido de percurso dos pontos e
+        arbitrario (vem do encadeamento do mapa): a janela segue na
+        direcao que aponta junto com o carro, decidida pela MEDIA de ~6 m
+        de trajetoria e com histerese (so inverte com vantagem clara).
+
+        Retorna (path (M,2) [lateral, frente], v_alvo, idx_mais_proximo,
+        erro_lateral_m) ou None sem pose.
         """
-        try:
-            pose = self.car_node.get_pose("map")
-            if pose is None:
-                return
-            tx = pose[0]
-            ty = pose[1]
-            yaw = pose[2]
-        except:
-            # Fallback: usa posição atual da odometria
-            if not self.path_x:
-                return
-            tx, ty = self.path_x[-1], self.path_y[-1]
-            # talvez essa linha esteja atrapalhando o set do referencial: yaw = 0.0
-
-        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-
-        local_points = []
-
-        for cone in self.points:
-            mx = cone[0]
-            my = cone[1]
-
-            dx = mx - tx 
-            dy = my - ty
-
-            lx = cos_y * dx + sin_y * dy
-            ly = - sin_y * dx + cos_y * dy
-
-            local_points.append([ly,lx]) #preciso inverter pois esperamos [lateral, frente]
-
-        local = np.array(local_points)
-        nearest = int(np.argmin(np.linalg.norm(local, axis=1)))
+        if pose is None or len(self.points) < 3:
+            return None
+        local = world_to_car(self.points, pose)       # [lateral(+dir), frente]
+        dist = np.hypot(local[:, 0], local[:, 1])
+        nearest = int(np.argmin(dist))
         n = len(self.points)
 
-        # quao "a frente" do carro fica a trajetoria seguindo cada sentido
         k = max(2, int(self.DIRECTION_HORIZON / RESAMPLE_STEP))
         off = np.arange(1, k + 1)
         fwd_pos = float(np.mean(local[(nearest + off) % n, 1]))
@@ -115,9 +83,8 @@ class GlobalTrajectory:
 
         n_points = max(2, int(window / RESAMPLE_STEP))
         idx = (nearest + step * np.arange(n_points)) % n
-
         path = np.vstack([[0.0, 0.0], local[idx]])
-        return path, float(self.speeds[nearest]), nearest
+        return path, float(self.speeds[nearest]), nearest, float(dist[nearest])
 
 
 class GlobalPlanner:
@@ -134,17 +101,20 @@ class GlobalPlanner:
     velocidade maxima e usado -- cresce a cada volta completada.
     """
 
-    def buildTrajectory(self, car_node, cones_world, aggressiveness, debug=None):
+    def buildTrajectory(self, cones_world, aggressiveness, debug=None):
+        """Retorna GlobalTrajectory ou None (motivo em debug['fail'])."""
         if debug is None:
             debug = {}
         cones_world = np.asarray(cones_world)
         debug['cones'] = len(cones_world)
         if len(cones_world) < 6:
+            debug['fail'] = 'poucos_cones'
             return None
 
         midpoints = self._trackMidpoints(cones_world)
         debug['midpoints'] = len(midpoints)
         if len(midpoints) < 4:
+            debug['fail'] = 'poucos_midpoints'
             return None
 
         centerline, closed = self._chainLoop(midpoints)
@@ -152,12 +122,21 @@ class GlobalPlanner:
         debug['gap_fechamento_m'] = (round(float(np.linalg.norm(
             centerline[-1] - centerline[0])), 1) if len(centerline) else None)
         if not closed:
+            debug['fail'] = 'laco_nao_fechou'
             return None
 
         centerline = self._resample(centerline)
         line = self._optimizeLine(centerline, cones_world, aggressiveness)
         speeds = self._speedProfile(line, aggressiveness)
-        return GlobalTrajectory(line, speeds, car_node)
+        traj = GlobalTrajectory(line, speeds, aggressiveness)
+        debug['n_points'] = len(line)
+        debug['length_m'] = round(traj.length, 1)
+        debug['v_max'] = round(float(speeds.max()), 2)
+        debug['v_min'] = round(float(speeds.min()), 2)
+        debug['offset_max_m'] = round(float(np.max(np.min(np.linalg.norm(
+            line[:, None, :] - centerline[None, :, :], axis=2), axis=1))), 2)
+        debug['kappa_max'] = round(float(self._curvature(line).max()), 3)
+        return traj
 
     def _trackMidpoints(self, cones):
         # so azul/amarelo entram na triangulacao: os cones laranja da
@@ -297,30 +276,31 @@ class GlobalPlanner:
     def _optimizeLine(self, centerline, cones, aggressiveness):
         """Suavizacao iterativa restrita ao corredor (linha de menor curvatura).
 
-        Cada ponto e puxado para a media dos vizinhos (reduz curvatura) e
-        depois projetado de volta para dentro do corredor permitido em
-        torno da linha central. Com aggressiveness 0 ainda suaviza dentro
-        de MIN_SMOOTH_CORRIDOR (de-noise), sem buscar a linha de corrida.
+        Cada ponto e puxado para a media dos vizinhos (reduz curvatura) e o
+        deslocamento e limitado SO NA DIRECAO NORMAL a linha central (antes
+        era um disco em volta do ponto: os pontos escorregavam ao longo da
+        pista, embolavam e geravam picos de curvatura de raio < 1 m que o
+        perfil de velocidade transformava em freadas a 1.5 m/s). No fim a
+        linha e reamostrada com passo uniforme. Com aggressiveness 0 ainda
+        suaviza dentro de MIN_SMOOTH_CORRIDOR (tira o ziguezague).
         """
         half = self._corridorHalfWidth(centerline, cones)
         corridor = np.minimum(half, np.maximum(half * aggressiveness,
                                                MIN_SMOOTH_CORRIDOR))
         if corridor.max() <= 0.0:
             return centerline
+        tang = np.roll(centerline, -1, axis=0) - np.roll(centerline, 1, axis=0)
+        tang /= np.maximum(np.linalg.norm(tang, axis=1), 1e-9)[:, None]
+        normal = np.column_stack([-tang[:, 1], tang[:, 0]])
 
         line = centerline.copy()
-        n = len(line)
         for _ in range(SMOOTH_ITERATIONS):
             target = 0.5 * (np.roll(line, 1, axis=0) + np.roll(line, -1, axis=0))
-            line += SMOOTH_ALPHA * (target - line)
-
-            # projeta de volta no corredor em torno da linha central
-            offset = line - centerline
-            dist = np.linalg.norm(offset, axis=1)
-            over = dist > corridor
-            scale = np.where(over & (dist > 1e-9), corridor / np.maximum(dist, 1e-9), 1.0)
-            line = centerline + offset * scale[:, None]
-        return line
+            line = line + SMOOTH_ALPHA * (target - line)
+            off = np.einsum('ij,ij->i', line - centerline, normal)
+            off = np.clip(off, -corridor, corridor)
+            line = centerline + normal * off[:, None]
+        return self._resample(line)
 
     def _curvature(self, points):
         """Curvatura discreta (1/raio) por tres pontos consecutivos."""

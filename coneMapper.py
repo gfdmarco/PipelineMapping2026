@@ -1,161 +1,137 @@
-import rclpy
-from rclpy.node import Node
+"""Mapa global persistente de cones (frame `map`).
 
+Recebe os cones do frame ([lateral, frente, classe], no frame base_link),
+transforma para o mundo com a pose do SLAM e associa a landmarks ja
+existentes por vizinho mais proximo:
+
+  * associacao POR POSICAO (nao por cor): um cone com a cor trocada pelo
+    YOLO num frame nao vira um cone duplicado; a cor final e o voto
+    majoritario das deteccoes.
+  * posicao = media ponderada por 1/sigma^2, com sigma crescendo com a
+    distancia (deteccao de longe pesa menos).
+  * so deteccoes ate MAX_MAP_RANGE entram no mapa (de longe o erro de
+    distancia explode e gera fantasmas).
+  * `confirmed()` devolve so cones vistos >= CONFIRM_HITS vezes: e isso
+    que o planejador global usa (fantasma de 1 frame nao entra no Delaunay).
+
+Classe pura, sem ROS (roda igual no CarNode e no simulador 2D).
+"""
 import numpy as np
 
-from tf2_ros import Buffer, TransformListener, TransformException
-from rclpy.duration import Duration
+from .frames import car_to_world
 
-from std_msgs.msg import Float32,Float32MultiArray,MultiArrayDimension, Bool
-
-from . import carNode
-
-CONE_MERGE_DIST = 1.5
-
-# profundidade/lateral grande (lidar esparso, intrinsecos da camera) e
-# poluem o mapa com fantasmas. O carro passa perto de todos os cones ao
-# longo da volta, entao alcance curto nao perde cobertura
-MAX_MAP_RANGE = 12.0         # m
-
-# As deteccoes [lateral, frente] saem no frame do SENSOR (Lidar1 esta
-# 0.45 m a frente do centro do carro, ver settings.json do FSDS). Sem
-# compensar, cada cone mapeado para o mundo desloca 0.45 m na direcao do
-# heading -- o mesmo cone visto com headings diferentes (antes/depois de
-# uma curva) vira dois cones no mapa
-SENSOR_FWD_OFFSET = 0.45     # m
-
-# Ruido de medicao (cresce com a distancia), igual ao do SLAM
-MEAS_STD_BASE = 0.15         # m
-MEAS_STD_PER_M = 0.03        # m por metro
-
-# Associacao
-GATE_MIN = 1.2               # m
-GATE_MAX = 2.4               # m
-DRIFT_STD_RATE = 0.02        # m/s de deriva esperada desde a ultima vista
-DRIFT_AGE_CAP = 60.0         # s
-
-# Gestao de landmarks
-CONFIRM_HITS = 3             # deteccoes para confirmar um cone
-TENTATIVE_TIMEOUT = 3.0      # s sem rever um tentativo -> descarta
-MERGE_RADIUS = 1.5           # m: cones da mesma cor mais perto que isso fundem
-MERGE_PERIOD = 2.0           # s entre passadas incrementais de fusao
-
-# Janela de cones locais (formato da percepcao)
-LOCAL_AHEAD = 22.0
-LOCAL_BEHIND = 2.0
-LOCAL_LATERAL = 10.0
-
-# Linha de largada/chegada: cones laranja (2 = grande, 3 = pequeno) que
-# o FSDS coloca na largada. Servem de marco fisico para fechar a volta
-ORANGE_IDS = (2, 3)
-START_ANCHOR_RADIUS = 20.0   # m da origem do mapa onde procurar a linha
-START_ANCHOR_MIN_CONES = 2
-
-class ConeMapper(Node):
-    def __init__(self, car_node):
-        super().__init__('ConeMapper')
-
-        self.global_cones: list[dict] = []   # [{x, y, class_id}]
-        self.car_node = car_node
-
-    def globalizer(self, local_cones):
-        # Tenta pegar TF base_link → odom - CORRIGIDO PARA MAP por Gabriel(o frame de referência da odometria)
-        try:
-            pose = self.car_node.get_pose("map")
-            if pose is None:
-                return
-            tx = pose[0]
-            ty = pose[1]
-            yaw = pose[2]
-        except:
-            tx, ty = self.path_x[-1], self.path_y[-1]
-            # talvez essa linha esteja atrapalhando o set do referencial: yaw = 0.0
-
-        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-
-        for cone in local_cones:
-            lat = cone[0]
-            fwd = cone[1]
-            cls = cone[2]
-            mx = tx + fwd * cos_y - lat * sin_y
-            my = ty + fwd * sin_y + lat * cos_y
-            self._merge_cone(mx, my, cls)   # sem precisar inverter nada aqui
-
-        return self.global_cones
-
-    def _merge_cone(self, x, y, class_id):
-        for c in self.global_cones:
-            if np.hypot(x - c['x'], y - c['y']) < CONE_MERGE_DIST and c['class_id'] == class_id:
-                n = c['n']
-                c['x'] = (c['x'] * n + x) / (n + 1)
-                c['y'] = (c['y'] * n + y) / (n + 1)
-                c['n'] += 1
-                return
-        self.global_cones.append({'x': x, 'y': y, 'class_id': class_id, 'n': 1})
+ASSOC_DIST = 1.2         # m: deteccao a menos disso de um landmark = mesmo cone
+MAX_MAP_RANGE = 12.0     # m: deteccoes mais longe nao entram no mapa
+MEAS_STD_BASE = 0.10     # m
+MEAS_STD_PER_M = 0.03    # m por metro de distancia
+CONFIRM_HITS = 3         # deteccoes para o cone entrar no mapa "confirmado"
+N_CLASSES = 4            # 0 azul, 1 amarelo, 2 laranja grande, 3 laranja
 
 
-    def update(self, detections, now):
-        """Integra as deteccoes do frame ([lateral, frente, classId]) no mapa."""
-        detections = np.asarray(detections)
-        if detections.ndim != 2 or len(detections) == 0:
-            self._prune(now)
-            return
+class ConeMapper:
+    def __init__(self, assoc_dist=ASSOC_DIST, max_range=MAX_MAP_RANGE,
+                 confirm_hits=CONFIRM_HITS):
+        self.assoc_dist = assoc_dist
+        self.max_range = max_range
+        self.confirm_hits = confirm_hits
+        self.pos = np.empty((0, 2))          # (N,2) x, y no frame map
+        self.wsum = np.empty(0)              # soma dos pesos 1/sigma^2
+        self.votes = np.empty((0, N_CLASSES))
+        self.hits = np.empty(0, dtype=int)
+        self.first_t = np.empty(0)
+        self.last_t = np.empty(0)
+        self.first_lap = np.empty(0, dtype=int)
+        self.frozen = False                  # True = so localiza, nao edita
 
-        ranges = np.linalg.norm(detections[:, :2].astype(float), axis=1)
-        near = ranges <= MAX_MAP_RANGE
-        if not near.any():
-            self._prune(now)
-            return
-        detections = detections[near].astype(float)
-        ranges = ranges[near]
+    # ------------------------------------------------------------------
+    def update(self, local_cones, pose, t=0.0, lap=0):
+        """Integra um frame. Retorna estatisticas do frame (telemetria)."""
+        stats = {"n_in": 0, "n_far": 0, "n_new": 0, "n_assoc": 0}
+        cones = np.asarray(local_cones, dtype=float)
+        if cones.ndim != 2 or len(cones) == 0 or pose is None:
+            return stats
+        stats["n_in"] = len(cones)
 
-        # frame do sensor -> frame do carro (so para o mapa: o planner
-        # local continua recebendo as deteccoes cruas, como sempre)
-        detections[:, 1] += self.sensor_fwd_offset
+        rng = np.hypot(cones[:, 0], cones[:, 1])
+        near = rng <= self.max_range
+        stats["n_far"] = int((~near).sum())
+        if self.frozen or not near.any():
+            return stats
+        cones, rng = cones[near], rng[near]
 
-        world = self.car.get_pose("map")
+        world = car_to_world(cones[:, :2], pose)
+        cls = np.clip(cones[:, 2].astype(int), 0, N_CLASSES - 1)
+        w = 1.0 / (MEAS_STD_BASE + MEAS_STD_PER_M * rng) ** 2
 
-        # processa do mais perto para o mais longe (medicao mais precisa
-        # ganha a disputa) e bloqueia cada landmark a uma deteccao por frame
-        order = np.argsort(ranges)
         used = set()
-        for i in order:
+        for i in np.argsort(rng):            # mais perto (mais preciso) primeiro
             z = world[i]
-            cls = int(detections[i, 2])
-            meas_var = (MEAS_STD_BASE + MEAS_STD_PER_M * ranges[i]) ** 2
+            j = -1
+            if len(self.pos):
+                d = np.hypot(self.pos[:, 0] - z[0], self.pos[:, 1] - z[1])
+                if used:
+                    d[list(used)] = np.inf   # 1 deteccao por landmark por frame
+                k = int(np.argmin(d))
+                if d[k] < self.assoc_dist:
+                    j = k
+            if j < 0:
+                self._add(z, w[i], cls[i], t, lap)
+                used.add(len(self.pos) - 1)
+                stats["n_new"] += 1
+            else:
+                W = self.wsum[j] + w[i]
+                self.pos[j] = (self.pos[j] * self.wsum[j] + z * w[i]) / W
+                self.wsum[j] = W
+                self.votes[j, cls[i]] += 1
+                self.hits[j] += 1
+                self.last_t[j] = t
+                used.add(j)
+                stats["n_assoc"] += 1
+        return stats
 
-            idx = np.flatnonzero(self.cls == cls)
-            idx = idx[~np.isin(idx, list(used))] if used else idx
+    def _add(self, z, w, c, t, lap):
+        self.pos = np.vstack([self.pos, z])
+        self.wsum = np.append(self.wsum, w)
+        v = np.zeros((1, N_CLASSES)); v[0, c] = 1
+        self.votes = np.vstack([self.votes, v])
+        self.hits = np.append(self.hits, 1)
+        self.first_t = np.append(self.first_t, t)
+        self.last_t = np.append(self.last_t, t)
+        self.first_lap = np.append(self.first_lap, lap)
 
-            best = -1
-            if len(idx):
-                d = np.linalg.norm(self.pos[idx] - z, axis=1)
-                j = int(np.argmin(d))
-                age = min(now - self.seen[idx[j]], DRIFT_AGE_CAP)
-                S = self.var[idx[j]] + meas_var + (DRIFT_STD_RATE * age) ** 2
-                gate = np.clip(3.0 * np.sqrt(S), GATE_MIN, GATE_MAX)
-                if d[j] < gate:
-                    best = int(idx[j])
+    # ------------------------------------------------------------------
+    @property
+    def classes(self):
+        return self.votes.argmax(axis=1) if len(self.votes) else np.empty(0, dtype=int)
 
-            if best < 0:
-                self.pos = np.vstack([self.pos, z])
-                self.var = np.append(self.var, meas_var)
-                self.cls = np.append(self.cls, cls)
-                self.hits = np.append(self.hits, 1)
-                self.seen = np.append(self.seen, now)
-                used.add(len(self.var) - 1)
-                continue
+    def class_purity(self):
+        """Fracao de votos na classe vencedora (1.0 = YOLO sempre concordou)."""
+        if not len(self.votes):
+            return np.empty(0)
+        return self.votes.max(axis=1) / np.maximum(self.votes.sum(axis=1), 1)
 
-            gain = self.var[best] / (self.var[best] + meas_var)
-            self.pos[best] += gain * (z - self.pos[best])
-            self.var[best] *= (1.0 - gain)
-            self.hits[best] += 1
-            self.seen[best] = now
-            used.add(best)
+    def confirmed(self, min_hits=None):
+        """(N,3) [x, y, classe] dos cones confirmados (usado pelo planejador)."""
+        m = self.hits >= (self.confirm_hits if min_hits is None else min_hits)
+        if not m.any():
+            return np.empty((0, 3))
+        return np.column_stack([self.pos[m], self.classes[m]])
 
-        self._prune(now)
-        if now - self.last_merge > MERGE_PERIOD:
-            self.last_merge = now
-            self.mergeDuplicates()
+    def counts(self):
+        cls = self.classes
+        conf = self.hits >= self.confirm_hits
+        return {
+            "map_total": int(len(self.pos)),
+            "map_confirmed": int(conf.sum()),
+            "map_blue": int(((cls == 0) & conf).sum()),
+            "map_yellow": int(((cls == 1) & conf).sum()),
+            "map_orange": int(((cls >= 2) & conf).sum()),
+            "map_tentative": int((~conf).sum()),
+        }
 
-    
+    def snapshot(self):
+        """Mapa completo para a telemetria (dashboard compara com o GT)."""
+        cls, pur = self.classes, self.class_purity()
+        return [[round(float(self.pos[i, 0]), 3), round(float(self.pos[i, 1]), 3),
+                 int(cls[i]), int(self.hits[i]), round(float(pur[i]), 2),
+                 int(self.first_lap[i])] for i in range(len(self.pos))]
