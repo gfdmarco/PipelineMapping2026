@@ -12,6 +12,11 @@ ORANGE_ID = 2
 MAX_EDGE_LENGTH = 7.0   # m  -> descarta links azul<->amarelo longos demais
 MAX_STEP_LENGTH = 6.0   # m  -> corta o caminho se o proximo ponto pular demais
 
+SIDE_CHECK_RANGE = 10.0  # m a frente: ate onde vale a regra azul-a-esquerda
+MIN_SIDE_GAP = 1.5       # m: o amarelo precisa estar pelo menos isso a direita do azul
+
+HALF_WIDTH = 1.75          # m, meia largura da pista
+SINGLE_MAX_RANGE = 10.0    # m: cone sozinho mais longe que isso nao vale
 
 class PathPlanner:
     """Planejador de rota (linha central) via triangulacao de Delaunay.
@@ -43,7 +48,10 @@ class PathPlanner:
         self.midpoints = np.empty((0, 2))
 
         if cones is None or len(cones) < 3:
-            return np.empty((0, 2))
+            if cones is None or len(cones) == 0:
+                return np.empty((0, 2))
+            c = np.asarray(cones, dtype=np.float64)
+            return self._singleSidePath(c[:, :2], c[:, 2].astype(int))
 
         cones = np.asarray(cones, dtype=np.float64)
         xy = cones[:, :2]                  # (lateral, frente)
@@ -60,7 +68,7 @@ class PathPlanner:
 
         midpoints = self._trackMidpoints(xy, ids, tri.simplices)
         if midpoints.size == 0:
-            return np.empty((0, 2))
+            return self._singleSidePath(xy, ids)
 
         self.midpoints = midpoints
         return self._orderWaypoints(midpoints)
@@ -81,6 +89,13 @@ class PathPlanner:
                     continue
                 if np.linalg.norm(xy[a] - xy[b]) > self.max_edge_length:
                     continue
+                # o azul tem de estar a ESQUERDA do amarelo. So vale perto do
+                # carro, onde a pista esta ~alinhada com ele
+                ia, ib = (a, b) if ids[a] == self.blue_id else (b, a)   # ia = azul, ib = amarelo
+                if (max(xy[ia][1], xy[ib][1]) < SIDE_CHECK_RANGE
+                        and xy[ib][0] - xy[ia][0] < MIN_SIDE_GAP):
+                    continue
+                
                 midpoints.append((xy[a] + xy[b]) / 2.0)
 
         return np.array(midpoints) if midpoints else np.empty((0, 2))
@@ -104,6 +119,31 @@ class PathPlanner:
         path = midpoints[ordered]
         # prepende a posicao do carro para o caminho comecar embaixo do carro
         return np.vstack(([0.0, 0.0], path))
+
+    def _singleSidePath(self, xy, ids):
+        """Plano B: so um lado visivel -> rota deslocada meia pista da borda."""
+        fwd = (xy[:, 1] > 0) & (np.linalg.norm(xy, axis=1) < SINGLE_MAX_RANGE)
+        blue = xy[fwd & (ids == self.blue_id)]
+        yel = xy[fwd & (ids == self.yellow_id)]
+        if len(blue) == 0 and len(yel) == 0:
+            return np.empty((0, 2))
+        if len(blue) >= len(yel):
+            pts, side = blue, +1       # azul = borda esquerda -> rota a direita
+        else:
+            pts, side = yel, -1        # amarelo = borda direita -> rota a esquerda
+        pts = pts[np.argsort(np.linalg.norm(pts, axis=1))]
+        out = []
+        for i, p in enumerate(pts):
+            if len(pts) == 1:
+                d = np.array([0.0, 1.0])                     # supoe pista reta
+            elif i + 1 < len(pts):
+                d = pts[i + 1] - p                           # direcao da borda
+            else:
+                d = p - pts[i - 1]
+            d = d / max(np.linalg.norm(d), 1e-9)
+            right = np.array([d[1], -d[0]])                  # 90 graus a direita de d
+            out.append(p + side * HALF_WIDTH * right)
+        return np.vstack(([0.0, 0.0], out))
 
 
 class PathVisualizer:

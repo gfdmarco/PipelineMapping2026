@@ -18,7 +18,7 @@ MIN_TURN_COS = -0.3      #     -> proximo passo nao pode dobrar mais que ~107
 SMOOTH_ITERATIONS = 300
 SMOOTH_ALPHA = 0.2
 CAR_HALF_WIDTH = 0.7     # m
-SAFETY_MARGIN = 0.5      # m   -> distancia minima ate o cone alem do carro
+SAFETY_MARGIN = 0.9      # m   -> distancia minima ate o cone alem do carro (0.5 ate 17/10, depois 0.7)
 MIN_SMOOTH_CORRIDOR = 0.4  # m -> mesmo com agressividade 0 a linha pode se
                            #      mover ate isso: tira o ziguezague da
                            #      corrente de midpoints sem buscar a linha
@@ -28,12 +28,12 @@ MIN_SMOOTH_CORRIDOR = 0.4  # m -> mesmo com agressividade 0 a linha pode se
 MAX_LAT_ACC = 6.0        # m/s^2 -> aceleracao lateral maxima admitida
 MAX_LON_ACC = 4.0        # m/s^2 -> aceleracao para frente
 MAX_LON_DEC = 6.0        # m/s^2 -> frenagem
-MIN_SPEED = 4.0          # m/s
+MIN_SPEED = 4.5          # m/s
 MAX_SPEED = 12.0         # m/s   -> teto com agressividade maxima
 
 # Progressao por volta: comeca conservador e libera a cada volta completada.
 # aggressiveness 0 = linha central e MIN_SPEED; 1 = linha otimizada e MAX_SPEED
-AGGRESSIVENESS_PER_LAP = 0.34
+AGGRESSIVENESS_PER_LAP = 0.25
 
 
 class GlobalTrajectory:

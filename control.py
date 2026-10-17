@@ -16,22 +16,42 @@ STRAIGHT_MAX_ANGLE = 12.0 # graus -> reta so vale alinhada ao heading do carro
 STEERING_TAU = 0.1  # s   -> filtro passa-baixa do comando de steering
 
 # PID (longitudinal)
-TARGET_SPEED = 4      # m/s
-KP = 0.3
-KI = 0.05
+# Ganhos ajustados ao carro do FSDS, medido no run 20261010_024544:
+# ~25 m/s^2 por unidade de throttle, ~12 m/s^2 por unidade de freio,
+# ~0,15 s de atraso e controle a ~4,3 Hz. Com o KP antigo (0,3), 1 m/s de
+# erro ja saturava o throttle e cada frame somava ~2 m/s: liga-desliga.
+TARGET_SPEED = 4.5      # m/s
+KP = 0.06             # throttle por m/s de erro
+KI = 0.04             # throttle por (m/s * s) acumulado
 KD = 0.00
 MAX_THROTTLE = 0.3
 MAX_BRAKE = 0.5
 
+# Freio separado do acelerador: excesso pequeno de velocidade e corrigido
+# so tirando o pe (arrasto); o freio entra apenas acima da banda morta.
+BRAKE_DEADBAND = 0.5  # m/s acima do alvo antes de frear
+KP_BRAKE = 0.3        # freio por m/s alem da banda morta (= KP antigo)
+THROTTLE_RATE = 1.0   # throttle/s: rampa de subida (alivio e imediato)
+MAX_DT = 0.5          # s, limita o passo da integral apos travadas
+INTEGRAL_BAND = 1.5   # m/s: so integra perto do alvo (evita overshoot na largada)
+
 
 class PID:
-    """PID classico com saturacao da integral (anti-windup)."""
+    """PID classico com anti-windup.
 
-    def __init__(self, kp, ki, kd, integral_limit=2.0):
+    A integral e limitada e, quando o comando satura, so integra se o erro
+    estiver tirando o comando da saturacao (integracao condicional).
+    """
+
+    def __init__(self, kp, ki, kd, integral_limit=4.0,
+                 out_min=-np.inf, out_max=np.inf, integral_band=np.inf):
         self.kp = kp
+        self.integral_band = integral_band
         self.ki = ki
         self.kd = kd
         self.integral_limit = integral_limit
+        self.out_min = out_min
+        self.out_max = out_max
         self.reset()
 
     def reset(self):
@@ -40,16 +60,24 @@ class PID:
 
     def update(self, error, dt):
         if dt <= 0.0:
-            return self.kp * error
-
-        self.integral += error * dt
-        self.integral = np.clip(self.integral,
-                                -self.integral_limit, self.integral_limit)
+            return self.kp * error + self.ki * self.integral
+        dt = min(dt, MAX_DT)
 
         derivative = 0.0
         if self.prev_error is not None:
             derivative = (error - self.prev_error) / dt
         self.prev_error = error
+
+        step = error * dt
+        if abs(error) > self.integral_band:
+            step *= 0.25   # longe do alvo integra devagar (largada sem overshoot)
+        candidate = np.clip(self.integral + step,
+                            -self.integral_limit, self.integral_limit)
+        u = self.kp * error + self.ki * candidate + self.kd * derivative
+        saturated_high = u > self.out_max and error > 0.0
+        saturated_low = u < self.out_min and error < 0.0
+        if not (saturated_high or saturated_low):
+            self.integral = candidate
 
         return self.kp * error + self.ki * self.integral + self.kd * derivative
 
@@ -187,8 +215,13 @@ class VehicleController:
         self.max_throttle = max_throttle
         self.max_brake = max_brake
         self.lateral = PurePursuit()
-        self.longitudinal = PID(KP, KI, KD)
+        # integral negativa ate -BRAKE_DEADBAND*KP/KI: deixa o carro aliviar
+        # o throttle de manutencao sem empurrar para o freio
+        self.longitudinal = PID(KP, KI, KD, out_min=-BRAKE_DEADBAND * KP,
+                                out_max=max_throttle,
+                                integral_band=INTEGRAL_BAND)
         self.last_steering = 0.0
+        self.last_throttle = 0.0
         self.last_target = target_speed
         self.last_no_path = False
 
@@ -201,6 +234,7 @@ class VehicleController:
             # sem rota: segura o ultimo steering e desacelera
             self.longitudinal.reset()
             self.last_no_path = True
+            self.last_throttle = 0.0
             return self.last_steering, 0.0, 0.3 * self.max_brake
         self.last_no_path = False
 
@@ -212,8 +246,21 @@ class VehicleController:
 
         self.last_steering = steering
 
-        u = self.longitudinal.update(self.last_target - speed, dt)
+        error = self.last_target - speed
+        u = self.longitudinal.update(error, dt)
+
+        # acelerador: saida do PID com rampa de subida
         throttle = float(np.clip(u, 0.0, self.max_throttle))
-        brake = float(np.clip(-u, 0.0, self.max_brake))
+        if dt > 0.0:
+            throttle = min(throttle, self.last_throttle + THROTTLE_RATE * min(dt, MAX_DT))
+        self.last_throttle = throttle
+
+        # freio: so quando o excesso passa da banda morta (senao, alivia)
+        overspeed = -error - BRAKE_DEADBAND
+        brake = 0.0
+        if overspeed > 0.0:
+            brake = float(np.clip(KP_BRAKE * overspeed, 0.0, self.max_brake))
+            throttle = 0.0
+            self.last_throttle = 0.0
 
         return steering, throttle, brake

@@ -28,13 +28,16 @@ import numpy as np
 
 from . import pathPlanning, control, globalPlanning
 from .coneMapper import ConeMapper
-from .frames import wrap_angle
+from .frames import wrap_angle, car_to_world
 
 EXPLORE, TRACK = "EXPLORE", "TRACK"
 
 RETRY_PERIOD = 2.0         # s entre tentativas de montar a trajetoria
 TRACK_MAX_XTRACK = 3.0     # m: longe disso da trajetoria -> rota local
 
+LARGE_ORANGE_ID = 2
+GATE_RANGE = 6.0        # m: laranja grande a menos disso conta
+GATE_MIN_CONES = 2      # no mesmo quadro
 
 class LapDetector:
     """Fechamento de volta pela volta a pose de largada (frame odom).
@@ -59,8 +62,12 @@ class LapDetector:
         self.laps = 0
         self.lap_start_t = None
         self.last = {}             # ultimo estado (telemetria)
+        self.line_xy = None        # centro do portao laranja (linha de chegada)
+        self.last_step = 0.0
+        self.near_line = False
+        self.gate_left = None      # m que faltam ate a linha, desde que o portao foi visto
 
-    def update(self, pose_odom, t):
+    def update(self, pose_odom, t, cones=None):
         """Retorna dict do evento quando fecha uma volta, senao None."""
         if pose_odom is None:
             return None
@@ -71,7 +78,8 @@ class LapDetector:
             self.lap_start_t = t
             return None
 
-        self.dist_lap += math.hypot(x - self.last_pose[0], y - self.last_pose[1])
+        self.last_step = math.hypot(x - self.last_pose[0], y - self.last_pose[1])
+        self.dist_lap += self.last_step
         self.last_pose = pose_odom
         sx, sy, syaw = self.start_pose
         d_start = math.hypot(x - sx, y - sy)
@@ -79,19 +87,49 @@ class LapDetector:
         if d_start > self.rearm_dist and self.dist_lap > self.min_distance:
             self.armed = True
         self.last = {"dist_lap": self.dist_lap, "d_start": d_start,
-                     "heading_diff_deg": math.degrees(dh), "armed": self.armed}
+                    "heading_diff_deg": math.degrees(dh), "armed": self.armed}
 
-        if not (self.armed and d_start < self.pos_threshold
-                and dh < self.heading_threshold):
+        if not self.armed:
+            self.gate_left = None
+            return None
+
+        # portao laranja visto a frente: guarda quanto falta ate ele e so
+        # fecha a volta depois de percorrer essa distancia (na LINHA, nao
+        # quando o portao aparece a ~6 m)
+        step_d = self.last_step
+        if self.gate_left is not None:
+            self.gate_left -= step_d
+        if cones is not None and len(cones):
+            c = np.asarray(cones, dtype=float).reshape(-1, 3)
+            o = c[c[:, 2] == LARGE_ORANGE_ID]
+            near = o[(o[:, 1] > 0) & (np.linalg.norm(o[:, :2], axis=1) < GATE_RANGE)]
+            if len(near) >= GATE_MIN_CONES:
+                self.gate_left = float(np.mean(near[:, 1]))
+        gate = self.gate_left is not None and self.gate_left <= 0.0
+
+        # reserva: pela pose, quando passa a linha (ou a largada, se a linha
+        # ainda nao foi vista) olhando na direcao da largada
+        if self.line_xy is not None:
+            lx, ly = self.line_xy
+            d_line = math.hypot(x - lx, y - ly)
+            passed = (x - lx) * math.cos(syaw) + (y - ly) * math.sin(syaw) >= 0.0
+            by_pose = d_line < self.pos_threshold and passed and dh < self.heading_threshold
+        else:
+            by_pose = d_start < self.pos_threshold and dh < self.heading_threshold
+        self.near_line = (d_line if self.line_xy is not None else d_start) < self.pos_threshold
+        if not (gate or by_pose):
             return None
 
         self.laps += 1
         ev = {"lap": self.laps, "lap_time": t - self.lap_start_t,
-              "lap_dist": self.dist_lap, "d_start": d_start,
-              "heading_diff_deg": math.degrees(dh), "pose_odom": list(pose_odom)}
+            "lap_dist": self.dist_lap, "d_start": d_start,
+            "heading_diff_deg": math.degrees(dh),
+            "trigger": "laranja" if gate else "pose",
+            "pose_odom": list(pose_odom)}
         self.dist_total += self.dist_lap
         self.dist_lap = 0.0
         self.armed = False
+        self.gate_left = None
         self.lap_start_t = t
         return ev
 
@@ -131,6 +169,22 @@ class ProgressCounter:
             return True
         return False
 
+    def rebase(self, traj, nearest):
+        """Troca a trajetoria SEM perder o progresso da volta.
+
+        O progresso esta em indices da trajetoria antiga; converte para a
+        nova pela razao entre o numero de pontos (as duas cobrem a mesma
+        pista, reamostradas com passo uniforme) e reancora o indice atual.
+        """
+        n_new = len(traj.points)
+        if n_new <= 0:
+            return
+        scale = n_new / float(self.n)
+        self.u *= scale
+        self.next *= scale
+        self.n = n_new
+        self.last = nearest
+
 
 class Mission:
     def __init__(self, tele, lap_kwargs=None, freeze_map_in_track=False):
@@ -153,6 +207,14 @@ class Mission:
         self.last_build_try = -1e9
         self.path = np.empty((0, 2))
         self.frame = 0
+        # True quando quem chama roda control_step() num timer proprio no
+        # TRACK (CarNode/sim2d): o step() dos cones deixa de comandar o
+        # carro nesse modo, salvo quando cai para a rota local (fallback)
+        self.track_timer = False
+        self.gate_xy = None                  # centro do portao laranja no frame map
+        self.rebase_progress = False
+        self.last_source = "local"
+        self.last_cmd = (0.0, 0.0, 0.0)
 
     # ------------------------------------------------------------------
     def step(self, cones, pose_map, pose_odom, speed, dt, t, pose_meas=None):
@@ -167,6 +229,17 @@ class Mission:
         if self.start_xy is None and pose_map is not None:
             self.start_xy = (pose_map[0], pose_map[1])
 
+        # 0) linha de chegada: centro do 1o portao laranja visto (largada)
+        if self.gate_xy is None and len(cones):
+            pg = pose_meas if pose_meas is not None else pose_map
+            o = cones[cones[:, 2] == LARGE_ORANGE_ID]
+            o = o[(o[:, 1] > 0) & (np.linalg.norm(o[:, :2], axis=1) < GATE_RANGE)]
+            if pg is not None and len(o) >= GATE_MIN_CONES:
+                w = car_to_world(o[:, :2], pg)
+                self.gate_xy = (float(w[:, 0].mean()), float(w[:, 1].mean()))
+                self.laps.line_xy = self.gate_xy
+                self.tele.event("gate_found", xy=list(self.gate_xy), n=len(o))
+
         # 1) mapa global
         tm = time.perf_counter()
         mstats = self.mapper.update(cones, pose_meas if pose_meas is not None else pose_map,
@@ -177,12 +250,20 @@ class Mission:
 
         # 2) volta. EXPLORE: volta a pose de largada (pose map do SLAM se
         #    houver, senao odom). TRACK: progresso na trajetoria (abaixo).
-        lap_ev = self.laps.update(pose_map if pose_map is not None else pose_odom, t)
+        # pose map: e o mesmo frame da linha de chegada (gate_xy)
+        lap_ev = self.laps.update(pose_map if pose_map is not None else pose_odom, t, cones)
         if lap_ev is not None:
-            if self.mode == EXPLORE:
+            if not self.lap1_closed:
                 self._on_lap(lap_ev, t, method="pose_largada")
             else:
                 self.tele.event("lap_check_pose", **lap_ev)   # so comparacao
+        # chegando na linha da volta 1 (portao a frente ou perto da largada):
+        # ja entra no TRACK para cruzar o portao pela trajetoria global; a
+        # volta em si so conta no cruzamento da linha (acima)
+        if (self.mode == EXPLORE and not self.lap1_closed and self.laps.armed
+                and (self.laps.gate_left is not None or self.laps.near_line)
+                and t - self.last_build_try > RETRY_PERIOD):
+            self._try_build(t, reason="pre_lap1")
         if (self.lap1_closed and self.mode == EXPLORE
                 and t - self.last_build_try > RETRY_PERIOD):
             self._try_build(t, reason="retry")
@@ -191,29 +272,20 @@ class Mission:
         tp = time.perf_counter()
         v_target, xtrack, source = None, None, "local"
         if self.mode == TRACK and self.trajectory is not None:
-            res = self.trajectory.localWindow(pose_map)
-            if res is None:
-                self.tele.periodic("track_fallback", 1.0, reason="sem_pose_map")
-            else:
-                path, v_target, nearest, xtrack = res
-                if self.progress is None:
-                    self.progress = ProgressCounter(self.trajectory, nearest,
-                                                    self.start_xy or (0.0, 0.0), t)
-                elif self.progress.update(nearest, self.trajectory._step):
-                    self._on_lap({"lap": self.lap_count + 1, "lap_time": t - self.last_lap_t,
-                                  "lap_dist": self.trajectory.length}, t, method="progresso")
-                if xtrack > TRACK_MAX_XTRACK:
-                    self.tele.periodic("track_fallback", 1.0, reason="xtrack",
-                                       xtrack=xtrack)
-                    v_target = None
-                else:
-                    self.path, source = path, "global"
+            path, v_target, xtrack = self._track_route(pose_map, t)
+            if path is not None:
+                self.path, source = path, "global"
         if source == "local":
             self.path = self.local_planner.planPath(cones)
         plan_ms = (time.perf_counter() - tp) * 1e3
 
-        # 4) controle
-        steer, thr, brk = self.controller.compute(self.path, speed, dt, v_target)
+        # 4) controle (no TRACK com timer, quem comanda e o control_step)
+        if self.track_timer and source == "global":
+            steer, thr, brk = self.last_cmd
+        else:
+            steer, thr, brk = self.controller.compute(self.path, speed, dt, v_target)
+            self.last_cmd = (steer, thr, brk)
+        self.last_source = source
 
         cls = cones[:, 2].astype(int) if len(cones) else np.empty(0, dtype=int)
         self.tele.event(
@@ -234,6 +306,52 @@ class Mission:
         return steer, thr, brk
 
     # ------------------------------------------------------------------
+    def _track_route(self, pose_map, t):
+        """TRACK: janela da trajetoria global + contagem de voltas por
+        progresso. Retorna (path, v_target, xtrack); path None = fallback."""
+        res = self.trajectory.localWindow(pose_map)
+        if res is None:
+            self.tele.periodic("track_fallback", 1.0, reason="sem_pose_map")
+            return None, None, None
+        path, v_target, nearest, xtrack = res
+        if self.progress is None:
+            # a volta fecha na LINHA (portao laranja), nao na pose de largada
+            line = self.gate_xy or self.start_xy or (0.0, 0.0)
+            self.progress = ProgressCounter(self.trajectory, nearest, line, t)
+            self.rebase_progress = False
+        elif self.rebase_progress:
+            # so limpa a flag quando o rebase acontece de fato: o _on_lap
+            # abaixo reconstroi a trajetoria e liga a flag de novo
+            self.rebase_progress = False
+            self.progress.rebase(self.trajectory, nearest)
+        elif self.progress.update(nearest, self.trajectory._step):
+            self._on_lap({"lap": self.lap_count + 1, "lap_time": t - self.last_lap_t,
+                          "lap_dist": self.trajectory.length}, t, method="progresso")
+        if xtrack > TRACK_MAX_XTRACK:
+            self.tele.periodic("track_fallback", 1.0, reason="xtrack", xtrack=xtrack)
+            return None, None, xtrack
+        return path, v_target, xtrack
+
+    def control_step(self, pose_map, speed, dt, t):
+        """Laco de controle rapido do TRACK (timer, sem esperar os cones).
+
+        Retorna (steering, throttle, brake), ou None quando nao esta no
+        TRACK ou a trajetoria nao serve (sem pose / longe dela): nesses
+        casos quem comanda e o step() dos cones, com a rota local.
+        """
+        if self.mode != TRACK or self.trajectory is None:
+            return None
+        path, v_target, xtrack = self._track_route(pose_map, t)
+        if path is None:
+            return None
+        self.path = path
+        cmd = self.controller.compute(path, speed, dt, v_target)
+        self.last_cmd = cmd
+        self.tele.event("ctl", v=speed, v_tgt=self.controller.last_target,
+                        steer=cmd[0], thr=cmd[1], brk=cmd[2], xtrack=xtrack,
+                        pm=list(pose_map) if pose_map is not None else None)
+        return cmd
+
     def _on_lap(self, ev, t, method):
         self.lap_count += 1
         ev = dict(ev, lap=self.lap_count, lap_time=t - self.last_lap_t)
@@ -263,7 +381,11 @@ class Mission:
                             aggr=aggr, build_ms=build_ms, **debug)
             return False
         self.trajectory = traj
-        self.progress = None        # recria no proximo frame com os novos indices
+        # mantem o progresso da volta: reancora na nova trajetoria no proximo
+        # frame (zerar aqui fazia o contador nunca fechar volta, porque a
+        # trajetoria e reconstruida a cada loop closure)
+        if self.progress is not None:
+            self.rebase_progress = True
         self.tele.event("traj_build", reason=reason, attempt=self.build_attempts,
                         aggr=aggr, build_ms=build_ms, **debug)
         self.tele.event("traj_snapshot", lap=laps_done, aggr=aggr,
