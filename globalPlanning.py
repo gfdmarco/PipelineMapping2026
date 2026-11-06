@@ -6,13 +6,22 @@ from .frames import world_to_car
 # Construcao da linha central global
 RESAMPLE_STEP = 1.0      # m   -> espacamento dos pontos da trajetoria
 MAX_CHAIN_STEP = 6.0     # m   -> salto maximo entre midpoints ao ordenar
-CLOSE_LOOP_DIST = 8.0    # m   -> dist ultimo->primeiro para fechar o laco
+CLOSE_LOOP_DIST = 10.0   # m   -> dist ultimo->primeiro para fechar o laco (8 ate 06/11)
 MIN_LOOP_LENGTH = 60.0   # m   -> laco mais curto que isso e um falso ciclo
                          #        local de midpoints, nao a pista
 MIDPOINT_MERGE = 0.8     # m   -> midpoints mais proximos que isso viram um so
 CHAIN_STARTS = 8         #     -> tentativas de encadeamento (inicios diferentes)
-MIN_TURN_COS = -0.3      #     -> proximo passo nao pode dobrar mais que ~107
-                         #        graus em relacao ao passo anterior
+MIN_TURN_COS = 0.5       #     -> proximo passo nao pode dobrar mais que ~60
+                         #        graus em relacao ao passo anterior (-0.3 ate 06/11)
+# Correcoes de 06/11 (GA offline nos mapas dos runs 152737/153358/153930: trajetoria
+# valida em 56% -> 94% dos mapas reais). Na pista C o laco nao fechava NEM com os
+# cones perfeitos do GT: buraco de 6.6 m sem par azul/amarelo logo apos a largada.
+BRIDGE_STEP = 17.0       # m   -> sem midpoint a < MAX_CHAIN_STEP, aceita um ate aqui...
+BRIDGE_COS = 0.88        #     -> ...se estiver quase em linha reta (atravessa buracos)
+MIDPOINT_MIN_CLEAR = 1.3 # m   -> midpoint mais perto que isso de um cone e aresta
+                         #        espuria (cone duplicado/fantasma, diagonal em curva)
+MIN_TRAJ_CLEARANCE = 0.9 # m   -> trajetoria com ponto mais perto que isso de um cone
+                         #        e rejeitada (o Mission mantem a anterior e tenta de novo)
 
 # Otimizacao da linha (suavizacao com restricao de corredor)
 SMOOTH_ITERATIONS = 300
@@ -127,6 +136,13 @@ class GlobalPlanner:
 
         centerline = self._resample(centerline)
         line = self._optimizeLine(centerline, cones_world, aggressiveness)
+        bc = cones_world[cones_world[:, 2].astype(int) <= YELLOW_ID, :2]
+        clr = float(np.min(np.linalg.norm(line[:, None, :] - bc[None, :, :], axis=2)))
+        debug['folga_min_m'] = round(clr, 2)
+        if clr < MIN_TRAJ_CLEARANCE:
+            # mapa torto/duplicado gera linha colada num cone: melhor manter a anterior
+            debug['fail'] = 'folga_baixa'
+            return None
         speeds = self._speedProfile(line, aggressiveness)
         traj = GlobalTrajectory(line, speeds, aggressiveness)
         debug['n_points'] = len(line)
@@ -167,7 +183,13 @@ class GlobalPlanner:
                 if np.linalg.norm(xy[a] - xy[b]) > MAX_EDGE_LENGTH:
                     continue
                 midpoints.append((xy[a] + xy[b]) / 2.0)
-        return np.array(midpoints) if midpoints else np.empty((0, 2))
+        if not midpoints:
+            return np.empty((0, 2))
+        mp = np.array(midpoints)
+        if MIDPOINT_MIN_CLEAR > 0:
+            d = np.min(np.linalg.norm(mp[:, None, :] - xy[None, :, :], axis=2), axis=1)
+            mp = mp[d >= MIDPOINT_MIN_CLEAR]
+        return mp
 
     def _chainLoop(self, midpoints):
         """Ordena os midpoints em um laco fechado, de forma robusta a ruido.
@@ -221,6 +243,9 @@ class GlobalPlanner:
                 # so dobra para tras se nao houver caminho seguindo em frente
                 if forward.any():
                     ok = forward
+                if not ok.any() and BRIDGE_STEP > 0:
+                    # ponte: buraco de midpoints (largada, trecho mal mapeado)
+                    ok = (dist < BRIDGE_STEP) & (cos > BRIDGE_COS)
             if not ok.any():
                 break
 

@@ -187,7 +187,7 @@ class ProgressCounter:
 
 
 class Mission:
-    def __init__(self, tele, lap_kwargs=None, freeze_map_in_track=False):
+    def __init__(self, tele, lap_kwargs=None, freeze_map_in_track=False, freeze_after_laps=0):
         self.tele = tele
         self.local_planner = pathPlanning.PathPlanner()
         self.global_planner = globalPlanning.GlobalPlanner()
@@ -195,6 +195,17 @@ class Mission:
         self.mapper = ConeMapper()
         self.laps = LapDetector(**(lap_kwargs or {}))
         self.freeze_map_in_track = freeze_map_in_track
+        # Regra (06/11): o mapa de cones congela ao FECHAR a volta N (0 = nunca).
+        # O mapa melhora ate a volta 3 (erro alinhado 0.65 -> 0.36 -> 0.20 m no
+        # run 20261106_131508); depois disso so acumula risco (fantasmas
+        # temporarios, falso loop closure tardio, custo do reproject crescendo).
+        self.freeze_after_laps = freeze_after_laps
+        # lap_count no instante do congelamento: deteccoes com lap >= isto
+        # (gravadas pelo CarNode) ficam FORA do mapa, inclusive no reproject
+        self.frozen_at_lap = None
+        # trajetoria percorrida (x, y, yaw no map, a cada ~0.5 m): usada para a
+        # cor geometrica dos cones (ConeMapper.apply_side) ao montar a trajetoria
+        self.pose_hist = []
 
         self.mode = EXPLORE
         self.trajectory = None
@@ -228,6 +239,10 @@ class Mission:
             self.last_lap_t = t
         if self.start_xy is None and pose_map is not None:
             self.start_xy = (pose_map[0], pose_map[1])
+        if pose_map is not None and (not self.pose_hist or
+                                     math.hypot(pose_map[0] - self.pose_hist[-1][0],
+                                                pose_map[1] - self.pose_hist[-1][1]) >= 0.5):
+            self.pose_hist.append(tuple(pose_map))
 
         # 0) linha de chegada: centro do 1o portao laranja visto (largada)
         if self.gate_xy is None and len(cones):
@@ -358,11 +373,18 @@ class Mission:
         self.last_lap_t = t
         self.tele.event("lap_closed", mode=self.mode, method=method, **ev, **self.mapper.counts())
         self.tele.event("map_snapshot", lap=ev["lap"], cones=self.mapper.snapshot())
+        if self.freeze_after_laps and self.lap_count >= self.freeze_after_laps and not self.mapper.frozen:
+            self._freeze_map(t, reason=f"lap{self.lap_count}")
         if ev["lap"] == 1:
             self.lap1_closed = True
             self._try_build(t, reason="lap1")
         elif self.mode == TRACK:
             self._try_build(t, reason=f"lap{ev['lap']}")
+
+    def _freeze_map(self, t, reason):
+        self.mapper.frozen = True
+        self.frozen_at_lap = self.lap_count
+        self.tele.event("map_frozen", reason=reason, lap=self.lap_count, **self.mapper.counts())
 
     def _try_build(self, t, reason):
         self.last_build_try = t
@@ -371,6 +393,11 @@ class Mission:
         # 1a trajetoria com agressividade 0 (linha central, v minima); sobe
         # AGGRESSIVENESS_PER_LAP a cada volta completada no TRACK
         aggr = min(1.0, globalPlanning.AGGRESSIVENESS_PER_LAP * max(0, laps_done - 1))
+        # cor geometrica: se o reproject ja calculou o lado com as poses
+        # OTIMIZADAS do Cartographer, mantem; senao usa as poses ao vivo (que
+        # sao as mesmas com que este mapa foi montado)
+        if not getattr(self.mapper, "side_from_slam", False):
+            self.mapper.apply_side(self.pose_hist)
         cones = self.mapper.confirmed()
         debug = {}
         tb = time.perf_counter()
@@ -394,8 +421,8 @@ class Mission:
             self.tele.event("mode_switch", frm=self.mode, to=TRACK, lap=laps_done,
                             attempt=self.build_attempts)
             self.mode = TRACK
-            if self.freeze_map_in_track:
-                self.mapper.frozen = True
+            if self.freeze_map_in_track and not self.mapper.frozen:
+                self._freeze_map(None, reason="enter_track")
         return True
 
 

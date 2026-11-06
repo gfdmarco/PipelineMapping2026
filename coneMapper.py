@@ -13,6 +13,12 @@ existentes por vizinho mais proximo:
     distancia explode e gera fantasmas).
   * `confirmed()` devolve so cones vistos >= CONFIRM_HITS vezes: e isso
     que o planejador global usa (fantasma de 1 frame nao entra no Delaunay).
+  * cor GEOMETRICA (06/11, `apply_side`): azul fica a ESQUERDA e amarelo a
+    DIREITA do sentido de percurso. Para cada cone, pega a pose da trajetoria
+    percorrida mais proxima e ve de que lado ele esta (y no frame do carro,
+    REP-103). Isso vira um voto extra de peso 0.5*votos+1 -- a geometria
+    decide, salvo se a percepcao discordar por mais de ~3x. Nao mexe nos
+    laranjas. Teste contra o GT (run 20261106_145750): 192/192 lados certos.
 
 Classe pura, sem ROS (roda igual no CarNode e no simulador 2D).
 """
@@ -26,6 +32,8 @@ MEAS_STD_BASE = 0.10     # m
 MEAS_STD_PER_M = 0.03    # m por metro de distancia
 CONFIRM_HITS = 3         # deteccoes para o cone entrar no mapa "confirmado"
 N_CLASSES = 4            # 0 azul, 1 amarelo, 2 laranja grande, 3 laranja
+SIDE_MAX_DIST = 4.0      # m: cone mais longe que isso da trajetoria -> sem voto geometrico
+SIDE_MIN_LAT = 0.3       # m: |lateral| menor que isso (cone "em cima" da trajetoria) -> ambiguo
 
 
 class ConeMapper:
@@ -42,6 +50,7 @@ class ConeMapper:
         self.last_t = np.empty(0)
         self.first_lap = np.empty(0, dtype=int)
         self.frozen = False                  # True = so localiza, nao edita
+        self.side = np.empty(0, dtype=int)   # +1 esquerda (azul), -1 direita (amarelo), 0 sem info
 
     # ------------------------------------------------------------------
     def update(self, local_cones, pose, t=0.0, lap=0):
@@ -100,9 +109,57 @@ class ConeMapper:
         self.first_lap = np.append(self.first_lap, lap)
 
     # ------------------------------------------------------------------
+    def apply_side(self, poses):
+        """Calcula o lado de cada cone em relacao a trajetoria percorrida.
+
+        poses: (M,3) [x, y, yaw] no frame map (ex.: nos do Cartographer ou o
+        historico de poses do Mission). Recalcula do zero a cada chamada (nao
+        acumula). Retorna quantos cones mudaram de cor por causa disso."""
+        poses = np.asarray(poses, dtype=float).reshape(-1, 3)
+        n = len(self.pos)
+        before = self.classes.copy()
+        self.side = np.zeros(n, dtype=int)
+        if n == 0 or len(poses) < 2:
+            return 0
+        for a in range(0, n, 256):                       # em blocos: N x M sem estourar memoria
+            P = self.pos[a:a + 256]
+            dx = P[:, None, 0] - poses[None, :, 0]
+            dy = P[:, None, 1] - poses[None, :, 1]
+            k = np.argmin(dx * dx + dy * dy, axis=1)
+            r = np.arange(len(P))
+            ddx, ddy = dx[r, k], dy[r, k]
+            yaw = poses[k, 2]
+            left = -np.sin(yaw) * ddx + np.cos(yaw) * ddy   # y do cone no frame do carro (REP-103)
+            ok = (np.hypot(ddx, ddy) <= SIDE_MAX_DIST) & (np.abs(left) >= SIDE_MIN_LAT)
+            self.side[a:a + 256] = np.where(ok, np.sign(left), 0).astype(int)
+        return int((self.classes != before).sum())
+
+    def _side_padded(self):
+        n = len(self.votes)
+        if len(self.side) >= n:
+            return self.side[:n]
+        return np.r_[self.side, np.zeros(n - len(self.side), dtype=int)]   # cones novos: sem info
+
     @property
     def classes(self):
-        return self.votes.argmax(axis=1) if len(self.votes) else np.empty(0, dtype=int)
+        if not len(self.votes):
+            return np.empty(0, dtype=int)
+        base = self.votes.argmax(axis=1)
+        side = self._side_padded()
+        m = (side != 0) & (base <= 1)            # so azul/amarelo; laranjas ficam como estao
+        if not m.any():
+            return base
+        v = self.votes.copy()
+        extra = 0.5 * v.sum(axis=1) + 1.0
+        v[m & (side > 0), 0] += extra[m & (side > 0)]
+        v[m & (side < 0), 1] += extra[m & (side < 0)]
+        return np.where(m, v[:, :2].argmax(axis=1), base)
+
+    def side_fixed(self):
+        """Quantos cones tem a cor final diferente do voto puro da percepcao."""
+        if not len(self.votes):
+            return 0
+        return int((self.classes != self.votes.argmax(axis=1)).sum())
 
     def class_purity(self):
         """Fracao de votos na classe vencedora (1.0 = YOLO sempre concordou)."""
@@ -127,6 +184,7 @@ class ConeMapper:
             "map_yellow": int(((cls == 1) & conf).sum()),
             "map_orange": int(((cls >= 2) & conf).sum()),
             "map_tentative": int((~conf).sum()),
+            "map_color_fixed_by_side": self.side_fixed(),
         }
 
     def snapshot(self):
